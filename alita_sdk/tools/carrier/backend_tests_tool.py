@@ -4,7 +4,7 @@ from typing import Type, Optional, List, Dict, Union
 
 from datetime import datetime
 from langchain_core.tools import BaseTool, ToolException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 from .api_wrapper import CarrierAPIWrapper
 from .backend_reports_tool import BaseCarrierTool
@@ -86,12 +86,58 @@ class GetBackendTestsTool(BaseTool):
             logger.error(f"Error getting tests: {stacktrace}")
             raise ToolException(stacktrace)
 
+    @tool_logger  
+    def get_tests_with_environments(self) -> str:
+        """
+        Extended method to get backend tests with their environments for thresholds configuration.
+        This replaces the need for a separate ShowBackendTestsAndEnvsTool.
+        """
+        try:
+            tests = self.api_wrapper.get_tests_list()
+            if not tests:
+                return "❌ No backend tests found."
+
+            lines: List[str] = [
+                "🎯 Available backend tests and environments:",
+                ""
+            ]
+            for test in tests:
+                name = test.get("name")
+                if not name:
+                    continue
+                try:
+                    envs = self.api_wrapper.get_backend_environments(name)
+                    envs_str = ", ".join(envs) if envs else "No environments found"
+                except Exception as e:
+                    logger.warning(f"Failed to fetch envs for {name}: {e}")
+                    envs_str = "Failed to fetch"
+                lines.append(f"  • {name}: (envs: {envs_str})")
+
+            lines += [
+                "",
+                "Next: use get_backend_requests to list request names for a test/environment,",
+                "or use create_backend_threshold to create a threshold."
+            ]
+            return "\n".join(lines)
+        except Exception as e:
+            logger.exception("Failed to list tests and envs")
+            raise ToolException(str(e))
+
 
 # ====================================================================================
 # TOOL: GetTestByIDTool (No changes needed, but included for completeness)
 # ====================================================================================
 class GetTestByIdInput(BaseModel):
-    test_id: str = Field(description="The ID of the test to retrieve.")
+    test_id: Optional[str] = Field(default=None, description="The ID of the test to retrieve.")
+    test_name: Optional[str] = Field(default=None, description="The name of the test to retrieve.")
+
+    @validator('test_id', pre=True, always=True)
+    def validate_test_identifier(cls, v, values):
+        """Ensure either test_id or test_name is provided."""
+        test_name = values.get('test_name')
+        if not v and not test_name:
+            raise ValueError("Either test_id or test_name must be provided")
+        return v
 
 
 class GetTestByIDTool(BaseTool):
@@ -102,16 +148,27 @@ class GetTestByIDTool(BaseTool):
     args_schema: Type[BaseModel] = GetTestByIdInput
 
     @tool_logger
-    def _run(self, test_id: str):
+    def _run(self, test_id: Optional[str] = None, test_name: Optional[str] = None):
         try:
             tests = self.api_wrapper.get_tests_list()
-            test_data = next((test for test in tests if str(test.get("id")) == test_id), None)
-            if not test_data:
-                raise ToolException(f"Test with ID {test_id} not found.")
+            
+            # Find test by ID or name
+            test_data = None
+            if test_id is not None:
+                test_data = next((test for test in tests if str(test.get("id")) == test_id), None)
+                if not test_data:
+                    raise ToolException(f"Test with ID {test_id} not found.")
+            elif test_name is not None:
+                test_data = next((test for test in tests if test.get("name") == test_name), None)
+                if not test_data:
+                    raise ToolException(f"Test with name '{test_name}' not found.")
+            else:
+                raise ToolException("Either test_id or test_name must be provided.")
+            
             return json.dumps(test_data, indent=2)
         except Exception as e:
-            logger.error(f"Error finding test {test_id}: {e}")
-            raise ToolException(f"Could not retrieve test {test_id}.")
+            logger.error(f"Error finding test: {e}")
+            raise ToolException(f"Could not retrieve test.")
 
 
 # ====================================================================================
@@ -119,10 +176,19 @@ class GetTestByIDTool(BaseTool):
 # ====================================================================================
 class RunTestInput(BaseModel):
     """Defines the complete set of arguments for running a test."""
-    test_id: int = Field(description="The numeric ID of the test to run.")
+    test_id: Optional[int] = Field(default=None, description="The numeric ID of the test to run.")
+    test_name: Optional[str] = Field(default=None, description="The name of the test to run.")
     duration: Optional[int] = Field(default=None, description="Optional. Test duration in seconds.")
     users: Optional[int] = Field(default=None, description="Optional. Number of virtual users.")
     location: Optional[str] = Field(default=None, description="Optional. Location to run the test.")
+
+    @validator('test_id', pre=True, always=True)
+    def validate_test_identifier(cls, v, values):
+        """Ensure either test_id or test_name is provided."""
+        test_name = values.get('test_name')
+        if not v and not test_name:
+            raise ValueError("Either test_id or test_name must be provided")
+        return v
 
 
 class RunTestByIDTool(BaseTool):
@@ -135,22 +201,95 @@ class RunTestByIDTool(BaseTool):
     description: str = "Execute a backend performance test plan from the Carrier platform."
     args_schema: Type[BaseModel] = RunTestInput
 
+    def _get_available_locations(self) -> List[str]:
+        """Get list of available locations from the Carrier platform."""
+        try:
+            locations_response = self.api_wrapper.get_available_locations()
+            logger.debug(f"Available locations response: {locations_response}")
+            
+            # Extract actual location names from the nested response structure
+            # Response format: {"public_regions": ["default", "dial"], "project_regions": [], "cloud_regions": []}
+            location_names = []
+            
+            if isinstance(locations_response, dict):
+                # Iterate through all region types (public_regions, project_regions, cloud_regions)
+                for region_type, regions in locations_response.items():
+                    if isinstance(regions, list):
+                        location_names.extend([str(location) for location in regions if location])
+                    elif isinstance(regions, str):
+                        location_names.append(str(regions))
+            elif isinstance(locations_response, list):
+                # Fallback: if response is a direct list
+                location_names = [str(location) for location in locations_response if location]
+            
+            # Remove duplicates while preserving order
+            unique_locations = []
+            for loc in location_names:
+                if loc not in unique_locations:
+                    unique_locations.append(loc)
+            
+            logger.debug(f"Extracted location names: {unique_locations}")
+            return unique_locations
+                
+        except Exception as e:
+            logger.error(f"Failed to fetch available locations: {e}")
+            return []
+
     @tool_logger
-    def _run(self, test_id: int, **kwargs):
+    def _run(self, test_id: Optional[int] = None, test_name: Optional[str] = None, **kwargs):
         """
         This method now correctly receives all resolved parameters (including overrides)
-        and applies them before executing the test.
+        and applies them before executing the test. Supports both test_id and test_name.
         """
         try:
-            logger.info(f"Attempting to run test {test_id} with provided overrides: {kwargs}")
-
             # 1. Fetch the complete test data from the API
             tests = self.api_wrapper.get_tests_list()
-            test_data = next((t for t in tests if str(t.get("id")) == str(test_id)), None)
-            if not test_data:
-                raise ToolException(f"Test with id {test_id} not found.")
+            
+            # 2. Find test by ID or name
+            test_data = None
+            if test_id is not None:
+                logger.info(f"Attempting to run test by ID: {test_id}")
+                test_data = next((t for t in tests if str(t.get("id")) == str(test_id)), None)
+                if not test_data:
+                    raise ToolException(f"Test with ID {test_id} not found.")
+            elif test_name is not None:
+                logger.info(f"Attempting to run test by name: {test_name}")
+                test_data = next((t for t in tests if t.get("name") == test_name), None)
+                if not test_data:
+                    raise ToolException(f"Test with name '{test_name}' not found.")
+            else:
+                raise ToolException("Either test_id or test_name must be provided.")
+            
+            # Log the test being executed
+            actual_test_id = test_data.get('id')
+            logger.info(f"Found test: ID={actual_test_id}, Name='{test_data.get('name')}'")
+            logger.info(f"Provided overrides: {kwargs}")
 
-            # 2. Create a dictionary of the test's default parameters
+            # 3. Validate location if provided
+            if 'location' in kwargs and kwargs['location'] is not None:
+                requested_location = kwargs['location']
+                available_locations = self._get_available_locations()
+                if available_locations and requested_location not in available_locations:
+                    if not available_locations:
+                        raise ToolException(
+                            f"❌ Location '{requested_location}' is not available. "
+                            f"No locations are currently available on the platform."
+                        )
+                    else:
+                        available_locations_str = "', '".join(available_locations)
+                        example_location = available_locations[0]  # Use first available location for example
+                        raise ToolException(
+                            f"❌ Location '{requested_location}' is not available.\n\n"
+                            f"📍 **Available locations:** '{available_locations_str}'\n\n"
+                            f"💡 **Try again with:** 'Run backend test 246 from location {example_location}'"
+                        )
+                elif not available_locations:
+                    # If no locations available but none was specified, just log a warning
+                    logger.warning("No locations available from the platform, proceeding with default location")
+                else:
+                    logger.info(f"✅ Location '{requested_location}' validated successfully")
+
+            # 4. Create a dictionary of the test's default parameters
             default_params_list = test_data.get("test_parameters", [])
             final_params = {p['name']: p['default'] for p in default_params_list}
             logger.debug(f"Default parameters loaded: {final_params}")
@@ -162,10 +301,10 @@ class RunTestByIDTool(BaseTool):
 
             logger.info(f"Final parameters after override: {final_params}")
 
-            # 4. Convert the final parameters back to the list-of-dicts format the API expects
+            # 5. Convert the final parameters back to the list-of-dicts format the API expects
             api_test_parameters = [{"name": k, "default": str(v)} for k, v in final_params.items()]
 
-            # 5. Build the 'common_params' dictionary for the API request body
+            # 6. Build the 'common_params' dictionary for the API request body
             loc_ = kwargs.get("location", test_data.get("location", "default"))
             common_params = {
                 "name": test_data.get("name"),
@@ -181,15 +320,15 @@ class RunTestByIDTool(BaseTool):
             if "cloud_settings" in kwargs and kwargs["cloud_settings"] is not None:
                 common_params["env_vars"]["cloud_settings"] = kwargs["cloud_settings"]
 
-            # 6. Construct the final JSON body for the API call
+            # 7. Construct the final JSON body for the API call
             json_body = {
                 "common_params": common_params,
                 "test_parameters": api_test_parameters,
                 "integrations": test_data.get("integrations", {})
             }
 
-            # 7. Execute the test via the API wrapper
-            report_id = self.api_wrapper.run_test(str(test_id), json_body)
+            # 8. Execute the test via the API wrapper - use the actual test ID from test_data
+            report_id = self.api_wrapper.run_test(str(actual_test_id), json_body)
             # Build the correct report URL
             base_url = self.api_wrapper.url.rstrip('/')
             report_url = f"{base_url}/-/performance/backend/results?result_id={report_id}"
@@ -206,24 +345,39 @@ class RunTestByIDTool(BaseTool):
             }, indent=2)
 
         except Exception as e:
-            logger.exception(f"Critical failure in RunTestByIDTool for test {test_id}")
-            raise ToolException(f"Failed to run test {test_id}. Error: {e}")
+            logger.exception(f"Critical failure in RunTestByIDTool for test {test_id or test_name}")
+            raise ToolException(f"Failed to run test {test_id or test_name}. Error: {e}")
 
 
 # ====================================================================================
 # TOOL: CreateBackendTestTool (Included for completeness)
 # ====================================================================================
 class CreateBackendTestInput(BaseModel):
-    test_name: str = Field(..., description="Test name")
-    test_type: str = Field(..., description="Test type")
-    env_type: str = Field(..., description="Env type")
-    entrypoint: str = Field(..., description="Entrypoint for the test (JMeter script path or Gatling simulation path)")
-    custom_cmd: str = Field(..., description="Custom command line to execute the test")
-    runner: str = Field(..., description="Test runner (Gatling or JMeter)")
-    source: Optional[Dict[str, Optional[str]]] = Field(None, description="Test source configuration (Git repo)")
-    test_parameters: Optional[List[Dict[str, str]]] = Field(None, description="Test parameters")
-    email_integration: Optional[Dict[str, Optional[Union[int, List[str]]]]] = Field(None,
-                                                                                    description="Email integration configuration")
+    """Flexible input schema that can handle both individual parameters and full JSON configurations."""
+    
+    # Core parameters for simple usage
+    test_name: Optional[str] = Field(None, description="Test name")
+    name: Optional[str] = Field(None, description="Test name (alternative field)")
+    entrypoint: Optional[str] = Field(None, description="Entrypoint for the test")
+    runner: Optional[str] = Field(None, description="Test runner (Gatling or JMeter)")
+    source: Optional[Dict] = Field(None, description="Test source configuration")
+    test_parameters: Optional[List[Dict]] = Field(None, description="Test parameters")
+    
+    # Full configuration structure - allows passing complete JSON
+    common_params: Optional[Dict] = Field(None, description="Full common_params structure")
+    integrations: Optional[Dict] = Field(None, description="Integration settings")
+    scheduling: Optional[List] = Field(None, description="Scheduling configuration")
+    run_test: Optional[bool] = Field(None, description="Whether to run test immediately")
+    
+    # Additional individual parameters
+    test_type: Optional[str] = Field(None, description="Test type")
+    env_type: Optional[str] = Field(None, description="Environment type")
+    env_vars: Optional[Dict] = Field(None, description="Environment variables")
+    parallel_runners: Optional[int] = Field(None, description="Number of parallel runners")
+    location: Optional[str] = Field(None, description="Test location")
+    
+    class Config:
+        extra = "allow"  # Allow additional fields for maximum flexibility
 
 class CreateBackendTestTool(BaseCarrierTool):
     """⚗️ Creates new performance tests with comprehensive validation."""
@@ -232,60 +386,151 @@ class CreateBackendTestTool(BaseCarrierTool):
     description: str = "⚗️ Create a new performance test configuration"
     args_schema: Type[BaseModel] = CreateBackendTestInput
 
-    def _run(self, test_name: str, entrypoint: str, runner: str,
-             source: Dict, test_parameters: List[Dict] = None) -> str:
-        operation = f"creating test {test_name}"
-        start_time = datetime.now()
-
-        self.log_operation_start(
-            operation,
-            test_name=test_name,
-            runner=runner,
-            entrypoint=entrypoint,
-            param_count=len(test_parameters or [])
-        )
-
+    def _run(self, **kwargs) -> str:
+        """
+        Create a backend test with flexible input handling.
+        Can process both individual parameters and full JSON configurations.
+        """
         try:
-            # Validate runner format
-            available_runners = {
-                "JMeter_v5.6.3": "v5.6.3",
-                "JMeter_v5.5": "v5.5",
-                "Gatling_v3.7": "v3.7",
-                "Gatling_maven": "maven",
-            }
-
-            # Normalize runner
-            runner_value = available_runners.get(runner, runner)
-            if runner_value not in available_runners.values():
-                raise ToolException(f"🔧 Invalid runner '{runner}'. Available: {list(available_runners.keys())}")
-
-            # Build test configuration
-            test_config = {
-                "common_params": {
-                    "name": test_name,
-                    "test_type": "default",
-                    "env_type": "default",
-                    "entrypoint": entrypoint,
-                    "runner": runner_value,
-                    "source": source,
-                    "env_vars": {
-                        "cpu_quota": 1,
-                        "memory_quota": 4,
+            # Check if this is a full JSON configuration (has common_params)
+            if 'common_params' in kwargs and kwargs['common_params']:
+                # Use the provided configuration directly
+                test_config = {
+                    "common_params": kwargs['common_params'],
+                    "test_parameters": kwargs.get('test_parameters', []),
+                    "integrations": kwargs.get('integrations', {}),
+                    "scheduling": kwargs.get('scheduling', []),
+                    "run_test": kwargs.get('run_test', False)
+                }
+                test_name = kwargs['common_params'].get('name', 'Unknown')
+            else:
+                # Extract individual parameters (handle both 'name' and 'test_name')
+                test_name = kwargs.get('test_name') or kwargs.get('name')
+                if not test_name:
+                    raise ToolException("test_name (or name) is required")
+                    
+                entrypoint = kwargs.get('entrypoint')
+                if not entrypoint:
+                    raise ToolException("entrypoint is required")
+                    
+                runner = kwargs.get('runner') or kwargs.get('test_runner')
+                if not runner:
+                    raise ToolException("runner is required")
+                
+                # Handle source parameter mapping (multiple possible names)
+                source = kwargs.get('source') or kwargs.get('source_repo_info') or kwargs.get('source_repo') or {}
+                
+                # Transform source if it has different field names
+                if source:
+                    if 'repository' in source:
+                        # Convert from intent extraction format to API format
+                        source = {
+                            "name": source.get('type', 'git_https'),
+                            "repo": source.get('repository'),
+                            "branch": source.get('branch', 'main'),
+                            "username": source.get('username', ''),
+                            "password": source.get('password', '')
+                        }
+                    elif 'url' in source:
+                        # Convert from alternate intent format to API format
+                        source = {
+                            "name": "git_https",
+                            "repo": source.get('url'),
+                            "branch": source.get('branch', 'main'),
+                            "username": source.get('username', ''),
+                            "password": source.get('password', '')
+                        }
+                
+                # Validate and normalize runner
+                available_runners = {
+                    "JMeter_v5.6.3": "v5.6.3",
+                    "JMeter_v5.5": "v5.5", 
+                    "Gatling_v3.7": "v3.7",
+                    "Gatling_maven": "maven",
+                }
+                runner_value = available_runners.get(runner, runner)
+                if runner_value not in available_runners.values():
+                    raise ToolException(f"🔧 Invalid runner '{runner}'. Available: {list(available_runners.keys())}")
+                
+                # Handle test_parameters format conversion
+                test_parameters = kwargs.get('test_parameters', [])
+                
+                # Convert different formats to API format
+                if isinstance(test_parameters, dict):
+                    # Convert from dict format: {'vUsers': 1, 'rampUp': 1} 
+                    # to list format: [{'name': 'vUsers', 'default': '1'}, ...]
+                    test_parameters = [
+                        {
+                            'name': key,
+                            'default': str(value),
+                            'type': 'string',
+                            'description': '',
+                            'action': ''
+                        }
+                        for key, value in test_parameters.items()
+                    ]
+                elif isinstance(test_parameters, list) and test_parameters:
+                    # Handle list format - convert 'value' to 'default' if needed
+                    for param in test_parameters:
+                        if isinstance(param, dict):
+                            if 'value' in param and 'default' not in param:
+                                param['default'] = str(param.pop('value'))
+                            # Ensure required fields exist
+                            param.setdefault('type', 'string')
+                            param.setdefault('description', '')
+                            param.setdefault('action', '')
+                
+                # Handle environment variables and custom command
+                env_vars = kwargs.get('env_vars', {})
+                custom_cmd = kwargs.get('custom_cmd', '')
+                
+                # Extract resource allocation if provided
+                resource_allocation = kwargs.get('resource_allocation', {})
+                
+                # Build env_vars structure
+                if not env_vars:
+                    env_vars = {
+                        "cpu_quota": kwargs.get('cpu_quota') or resource_allocation.get('cpu_quota', 1),
+                        "memory_quota": kwargs.get('memory_quota') or resource_allocation.get('memory_quota', 4),
                         "cloud_settings": {},
-                        "custom_cmd": ""
+                        "custom_cmd": custom_cmd
+                    }
+                elif custom_cmd and 'custom_cmd' not in env_vars:
+                    env_vars['custom_cmd'] = custom_cmd
+                
+                # Build configuration from individual parameters
+                test_config = {
+                    "common_params": {
+                        "name": test_name,
+                        "test_type": kwargs.get('test_type', 'default'),
+                        "env_type": kwargs.get('env_type', kwargs.get('environment', 'default')),
+                        "entrypoint": entrypoint,
+                        "runner": runner_value,
+                        "source": source,
+                        "env_vars": env_vars,
+                        "parallel_runners": kwargs.get('parallel_runners') or kwargs.get('number_of_parallel_runners') or resource_allocation.get('parallel_runners', 1),
+                        "cc_env_vars": {},
+                        "customization": {},
+                        "location": kwargs.get('location', 'default')
                     },
-                    "parallel_runners": 1,
-                    "cc_env_vars": {},
-                    "customization": {},
-                    "location": "default"
-                },
-                "test_parameters": test_parameters or [],
-                "integrations": {},
-                "scheduling": [],
-                "run_test": False
-            }
+                    "test_parameters": test_parameters,
+                    "integrations": kwargs.get('integrations', kwargs.get('email_integration', {})),
+                    "scheduling": kwargs.get('scheduling', []),
+                    "run_test": kwargs.get('run_test', False)
+                }
 
-            # Create test
+            operation = f"creating test {test_name}"
+            start_time = datetime.now()
+
+            self.log_operation_start(
+                operation,
+                test_name=test_name,
+                runner=test_config['common_params'].get('runner', 'unknown'),
+                entrypoint=test_config['common_params'].get('entrypoint', 'unknown'),
+                param_count=len(test_config.get('test_parameters', []))
+            )
+
+            # Create test using the API wrapper
             response = self.api_wrapper.create_test(test_config)
             test_info = response.json() if hasattr(response, 'json') else {"id": "created"}
 
@@ -296,10 +541,11 @@ class CreateBackendTestTool(BaseCarrierTool):
                 "message": f"✅ Test '{test_name}' created successfully",
                 "test_id": test_info.get('id'),
                 "test_name": test_info.get('name', test_name),
-                "runner": runner_value,
+                "runner": test_config['common_params'].get('runner'),
                 "creation_timestamp": datetime.now().isoformat()
             }, indent=2)
 
         except Exception as e:
+            operation = f"creating test"
             self.handle_api_error(operation, e)
 

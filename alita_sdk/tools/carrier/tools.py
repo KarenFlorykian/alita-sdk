@@ -11,8 +11,16 @@ from .utils.intent_utils import CarrierIntentExtractor
 # 1. IMPORT ALL ATOMIC TOOL CLASSES
 # ====================================================================================
 from .tickets_tool import FetchTicketsTool, CreateTicketTool
-from .backend_reports_tool import GetReportsTool, GetReportByIDTool, CreateBackendExcelReportTool
+from .backend_reports_tool import GetReportsTool, GetReportByIDTool, CreateBackendExcelReportTool, AddTagToReportTool
 from .backend_tests_tool import GetBackendTestsTool, GetTestByIDTool, RunTestByIDTool, CreateBackendTestTool
+from .backend_thresholds_tool import (
+    ShowBackendTestsAndEnvsTool,
+    GetBackendRequestsTool,
+    CreateBackendThresholdTool,
+    ListBackendThresholdsTool,
+    DeleteBackendThresholdTool,
+    UpdateBackendThresholdTool,
+)
 from .ui_reports_tool import GetUIReportsTool, GetUIReportByIDTool, GetUITestsTool
 from .run_ui_test_tool import RunUITestTool
 from .update_ui_test_schedule_tool import UpdateUITestScheduleTool
@@ -167,11 +175,14 @@ class CarrierOrchestrationEngine:
                     required_fields.append(field_name)
                     logger.debug(f"[OrchestrationEngine] Required field: {field_name}")
 
-            provided_keys = set(provided_params.keys())
-            missing = [field for field in required_fields if field not in provided_keys]
+            # Check for missing keys OR None values for required fields
+            missing = []
+            for field in required_fields:
+                if field not in provided_params or provided_params[field] is None:
+                    missing.append(field)
 
             logger.info(
-                f"[OrchestrationEngine] Required: {required_fields}, Provided: {list(provided_keys)}, Missing: {missing}")
+                f"[OrchestrationEngine] Required: {required_fields}, Provided: {list(provided_params.keys())}, Missing: {missing}")
             return missing
 
         except Exception as e:
@@ -288,6 +299,7 @@ ACTION_TOOL_MAP: Dict[str, Type[BaseTool]] = {
     "get_reports": GetReportsTool,
     "get_report_by_id": GetReportByIDTool,
     "create_backend_excel_report": CreateBackendExcelReportTool,
+    "add_tag_to_report": AddTagToReportTool,
 
     # Backend Test Management
     "get_backend_tests": GetBackendTestsTool,
@@ -296,6 +308,17 @@ ACTION_TOOL_MAP: Dict[str, Type[BaseTool]] = {
 
     # Backend Test Execution
     "run_test": RunTestByIDTool,
+
+    # Backend Thresholds
+    "set_backend_thresholds": ShowBackendTestsAndEnvsTool,
+    "show_backend_tests_and_envs": ShowBackendTestsAndEnvsTool,
+    "get_backend_requests": GetBackendRequestsTool,
+    "create_backend_threshold": CreateBackendThresholdTool,
+    "list_backend_thresholds": ListBackendThresholdsTool,
+    "delete_backend_threshold": DeleteBackendThresholdTool,
+    "delete_backend_thresholds": DeleteBackendThresholdTool,
+    "update_backend_threshold": UpdateBackendThresholdTool,
+    "update_backend_thresholds": UpdateBackendThresholdTool,
 
     # UI Analysis
     "get_ui_reports": GetUIReportsTool,
